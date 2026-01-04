@@ -48,7 +48,12 @@ def clean_text(text: str) -> str:
 
 def extract_trigrams(text: str):
     tokens = text.split()
-    return ["_".join(tokens[i:i+3]) for i in range(len(tokens) - 2)]
+    if len(tokens)>3:
+        return ["_".join(tokens[i:i+3]) for i in range(len(tokens) - 2)]
+    elif len(tokens) > 0:
+        return ["_".join(tokens)]
+    else:
+        return ["<EMPTY>"]
 
 
 # =========================
@@ -313,6 +318,52 @@ class Phase2ContrastivePipeline:
             "train_accuracy": accuracy_score(y_train, clf.predict(X_train)),
             "test_accuracy": accuracy_score(y_test, clf.predict(X_test))
         }
+
+    def predict_sentence(self, sentence: str):
+    """
+    Predict label for a single raw sentence
+    """
+
+        # ---- Step 1: clean text
+        clean = clean_text(sentence)
+    
+        # ---- Step 2: TF-IDF best span selection
+        best_span = self.span_selector.select_best_span(clean)
+    
+        # ---- Step 3: safe trigram extraction
+        trigrams = extract_trigrams(best_span)
+    
+        # ---- Step 4: trigram → ids
+        ids = [self.trigram_to_id.get(t, 0) for t in trigrams][:self.max_len]
+    
+        if len(ids) == 0:
+            ids = [self.trigram_to_id.get("<EMPTY>", 0)]
+    
+        length = len(ids)
+        ids += [0] * (self.max_len - length)
+    
+        # ---- Step 5: encode using BiLSTM
+        self.encoder.eval()
+        with torch.no_grad():
+            input_ids = torch.tensor([ids], dtype=torch.long).to(self.device)
+            lengths = torch.tensor([length], dtype=torch.long).to(self.device)
+    
+            embedding = self.encoder(input_ids, lengths).cpu().numpy()
+    
+        # ---- Step 6: classifier prediction
+        pred_id = self.classifier.predict(embedding)[0]
+        prob = self.classifier.predict_proba(embedding).max()
+    
+        # ---- Step 7: decode label
+        pred_label = self.label_encoder.inverse_transform([pred_id])[0]
+    
+        return {
+            "input_sentence": sentence,
+            "selected_span": best_span,
+            "predicted_label": pred_label,
+            "confidence": float(prob)
+        }
+
 
 
 # =========================
