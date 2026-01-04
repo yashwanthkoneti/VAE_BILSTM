@@ -1,0 +1,337 @@
+"""
+Phase 2: Supervised Contrastive Representation Learning
+------------------------------------------------------
+
+Pipeline:
+1. Clean text
+2. Select BEST continuous span using trigram TF-IDF
+3. Extract trigrams ONLY from that span
+4. Encode trigram sequence using BiLSTM (VAE-style encoder)
+5. Train using Supervised Contrastive Loss
+6. Freeze encoder
+7. Train classifier on latent embeddings
+8. Evaluate train & test accuracy
+
+No decoder. No KL. No CNN. No sliding window explosion.
+"""
+
+# =========================
+# Imports
+# =========================
+
+import re
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+
+# =========================
+# Text Utilities
+# =========================
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_trigrams(text: str):
+    tokens = text.split()
+    return ["_".join(tokens[i:i+3]) for i in range(len(tokens) - 2)]
+
+
+# =========================
+# TF-IDF Trigram Span Selector
+# =========================
+
+class TfidfTrigramSpanSelector:
+    """
+    Selects the continuous token span whose
+    overlapping trigram TF-IDF score is maximal.
+    """
+
+    def __init__(self, max_span_len: int = 50):
+        self.max_span_len = max_span_len
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=(3, 3),
+            min_df=2,
+            max_df=0.9
+        )
+
+    def fit(self, texts):
+        self.vectorizer.fit(texts)
+        return self
+
+    def select_best_span(self, text: str) -> str:
+        tokens = text.split()
+        n = len(tokens)
+
+        if n < 3:
+            return text
+
+        # ---- trigram list
+        trigrams = [
+            " ".join(tokens[i:i+3])
+            for i in range(n - 2)
+        ]
+
+        # ---- trigram TF-IDF scores
+        tfidf_scores = self.vectorizer.transform(trigrams).sum(axis=1).A1
+
+        # ---- project trigram scores to tokens
+        token_scores = np.zeros(n)
+        for i, score in enumerate(tfidf_scores):
+            token_scores[i]     += score
+            token_scores[i + 1] += score
+            token_scores[i + 2] += score
+
+        # ---- bounded max subarray (Kadane-style)
+        best_sum = -1
+        best_start = 0
+        curr_sum = 0
+        curr_start = 0
+
+        for i in range(n):
+            curr_sum += token_scores[i]
+
+            # enforce max span length
+            if i - curr_start + 1 > self.max_span_len:
+                curr_sum -= token_scores[curr_start]
+                curr_start += 1
+
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_start = curr_start
+                best_end = i
+
+            if curr_sum < 0:
+                curr_sum = 0
+                curr_start = i + 1
+
+        return " ".join(tokens[best_start: best_end + 1])
+
+
+# =========================
+# Dataset
+# =========================
+
+class SequenceDataset(Dataset):
+    def __init__(self, input_ids, lengths, labels):
+        self.input_ids = torch.tensor(input_ids, dtype=torch.long)
+        self.lengths = torch.tensor(lengths, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return self.input_ids[idx], self.lengths[idx], self.labels[idx]
+
+
+# =========================
+# Model Components
+# =========================
+
+class SupervisedContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings, labels):
+        embeddings = F.normalize(embeddings, dim=1)
+        sim = torch.matmul(embeddings, embeddings.T) / self.temperature
+
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(embeddings.device)
+        mask.fill_diagonal_(0)
+
+        exp_sim = torch.exp(sim) * (1 - torch.eye(sim.size(0)).to(sim.device))
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
+
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        return -mean_log_prob_pos.mean()
+
+
+class BiLSTMEncoder(nn.Module):
+    """
+    VAE-style encoder WITHOUT decoder
+    """
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, latent_dim=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            embed_dim,
+            hidden_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.fc = nn.Linear(hidden_dim * 2, latent_dim)
+
+    def forward(self, input_ids, lengths):
+        emb = self.embedding(input_ids)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            emb, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, (h_n, _) = self.lstm(packed)
+        h = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        return self.fc(h)
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# =========================
+# Pipeline
+# =========================
+
+class Phase2ContrastivePipeline:
+    def __init__(self, df, text_col, label_col, max_len=50, device=None):
+        self.df = df.copy()
+        self.text_col = text_col
+        self.label_col = label_col
+        self.max_len = max_len
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def prepare_data(self):
+        self.df["clean_text"] = self.df[self.text_col].apply(clean_text)
+
+        self.train_df, self.test_df = train_test_split(
+            self.df, test_size=0.2, random_state=42
+        )
+
+        # ---- TF-IDF span selector (TRAIN ONLY)
+        self.span_selector = TfidfTrigramSpanSelector(self.max_len)
+        self.span_selector.fit(self.train_df["clean_text"].tolist())
+
+        for df_part in [self.train_df, self.test_df]:
+            df_part["best_span"] = df_part["clean_text"].apply(
+                self.span_selector.select_best_span
+            )
+            df_part["trigrams"] = df_part["best_span"].apply(extract_trigrams)
+
+        # ---- build trigram vocab
+        counter = Counter()
+        for trigs in self.train_df["trigrams"]:
+            counter.update(trigs)
+
+        self.trigram_to_id = {t: i + 1 for i, (t, _) in enumerate(counter.items())}
+
+        def encode(trigs):
+            ids = [self.trigram_to_id.get(t, 0) for t in trigs][:self.max_len]
+            length = len(ids)
+            ids += [0] * (self.max_len - length)
+            return ids, length
+
+        for df_part in [self.train_df, self.test_df]:
+            encoded = df_part["trigrams"].apply(encode)
+            df_part["input_ids"] = encoded.apply(lambda x: x[0])
+            df_part["lengths"] = encoded.apply(lambda x: x[1])
+
+    def train_contrastive(self, epochs=20, batch_size=128):
+        X = np.stack(self.train_df["input_ids"])
+        L = self.train_df["lengths"].values
+        y = self.train_df[self.label_col].values
+
+        dataset = SequenceDataset(X, L, y)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        self.encoder = BiLSTMEncoder(
+            vocab_size=len(self.trigram_to_id) + 1
+        ).to(self.device)
+
+        self.projector = ProjectionHead(128).to(self.device)
+        criterion = SupervisedContrastiveLoss()
+        optimizer = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.projector.parameters()),
+            lr=1e-3
+        )
+
+        self.encoder.train()
+        self.projector.train()
+
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for ids, lens, labels in loader:
+                ids = ids.to(self.device)
+                lens = lens.to(self.device)
+                labels = labels.to(self.device)
+
+                z = self.encoder(ids, lens)
+                z_proj = self.projector(z)
+
+                loss = criterion(z_proj, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            print(f"Epoch {epoch+1}/{epochs} | Loss={total_loss:.4f}")
+
+    def train_classifier(self):
+        def encode_df(df_part):
+            self.encoder.eval()
+            with torch.no_grad():
+                ids = torch.tensor(
+                    np.stack(df_part["input_ids"]), dtype=torch.long
+                ).to(self.device)
+                lens = torch.tensor(df_part["lengths"].values).to(self.device)
+                return self.encoder(ids, lens).cpu().numpy()
+
+        X_train = encode_df(self.train_df)
+        y_train = self.train_df[self.label_col].values
+
+        X_test = encode_df(self.test_df)
+        y_test = self.test_df[self.label_col].values
+
+        clf = LogisticRegression(max_iter=500)
+        clf.fit(X_train, y_train)
+
+        return {
+            "train_accuracy": accuracy_score(y_train, clf.predict(X_train)),
+            "test_accuracy": accuracy_score(y_test, clf.predict(X_test))
+        }
+
+
+# =========================
+# End-to-End Run
+# =========================
+
+if __name__ == "__main__":
+    df = pd.read_csv("your_data.csv")
+
+    pipeline = Phase2ContrastivePipeline(
+        df=df,
+        text_col="description",
+        label_col="root_cause",
+        max_len=50
+    )
+
+    pipeline.prepare_data()
+    pipeline.train_contrastive(epochs=25)
+    metrics = pipeline.train_classifier()
+
+    print("\nFinal Metrics")
+    print(metrics)
